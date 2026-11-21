@@ -305,6 +305,67 @@ export function collectTabPaneInputs(
   return panes
 }
 
+/** The fleet-wide lookups a Smart scan resolves every workspace against; they depend only on their three inputs. */
+export type SmartAttentionIndexes = {
+  entriesByTabId: Map<string, AgentStatusEntry[]>
+  entriesByAttributedWorktreeId: Map<string, AgentStatusEntry[]>
+  mirroredTabIds: ReadonlySet<string>
+}
+
+export function buildSmartAttentionIndexes(
+  tabsByWorktree: Record<string, readonly SmartAttentionTab[]> | null,
+  agentStatusByPaneKey: AgentStatusRows | undefined,
+  migrationUnsupportedByPtyId?: Record<string, MigrationUnsupportedPtyEntry>
+): SmartAttentionIndexes {
+  const mirroredTabIds = new Set<string>()
+  for (const tabs of Object.values(tabsByWorktree ?? {})) {
+    for (const tab of tabs) {
+      mirroredTabIds.add(tab.id)
+    }
+  }
+  return {
+    entriesByTabId: buildExplicitEntriesByTabId(agentStatusByPaneKey, migrationUnsupportedByPtyId),
+    entriesByAttributedWorktreeId: buildExplicitEntriesByWorktreeId(agentStatusByPaneKey),
+    mirroredTabIds
+  }
+}
+
+/** One workspace's attention from prebuilt indexes, with per-pane hook authority and live-PTY-gated title fallbacks. */
+export function resolveWorktreeAttention(
+  worktree: Pick<Worktree, 'id' | 'lastActivityAt'>,
+  indexes: SmartAttentionIndexes,
+  sources: {
+    tabsByWorktree: Record<string, readonly SmartAttentionTab[]> | null
+    ptyIdsByTabId: Record<string, string[]>
+    runtimePaneTitlesByTabId: Record<string, Record<number, string>>
+    terminalLayoutsByTabId?: Record<string, TerminalLayoutSnapshot>
+  },
+  now: number
+): WorktreeAttention {
+  const tabs = sources.tabsByWorktree?.[worktree.id] ?? []
+  // Why: hook stamps can precede tab mirroring; once mirrored, live tab ownership wins so both worktrees aren't promoted.
+  const panes: PaneInput[] = (indexes.entriesByAttributedWorktreeId.get(worktree.id) ?? [])
+    .filter((entry) => {
+      const parsed = parsePaneKey(entry.paneKey)
+      return parsed !== null && !indexes.mirroredTabIds.has(parsed.tabId)
+    })
+    // No mirrored tab means no renderer live-PTY evidence to hold these hooks above Idle.
+    .map((entry) => ({ kind: 'hook' as const, entry, hasLivePty: false }))
+  if (tabs.length === 0) {
+    return resolveAttention(panes, now)
+  }
+  const paneSources: TabPaneInputSources = {
+    entriesByTabId: indexes.entriesByTabId,
+    ptyIdsByTabId: sources.ptyIdsByTabId,
+    runtimePaneTitlesByTabId: sources.runtimePaneTitlesByTabId,
+    terminalLayoutsByTabId: sources.terminalLayoutsByTabId
+  }
+  for (const tab of tabs) {
+    panes.push(...collectTabPaneInputs(tab, worktree.lastActivityAt, paneSources, now))
+  }
+  return resolveAttention(panes, now)
+}
+
 /** Resolve attention once per workspace with per-pane hook authority and live-PTY-gated title fallbacks. */
 export function buildAttentionByWorktree(
   worktrees: readonly Pick<Worktree, 'id' | 'lastActivityAt'>[],
@@ -316,41 +377,15 @@ export function buildAttentionByWorktree(
   migrationUnsupportedByPtyId?: Record<string, MigrationUnsupportedPtyEntry>,
   terminalLayoutsByTabId?: Record<string, TerminalLayoutSnapshot>
 ): Map<string, WorktreeAttention> {
-  const byTab = buildExplicitEntriesByTabId(agentStatusByPaneKey, migrationUnsupportedByPtyId)
-  const byAttributedWorktree = buildExplicitEntriesByWorktreeId(agentStatusByPaneKey)
-  const mirroredTabIds = new Set<string>()
-  for (const tabs of Object.values(tabsByWorktree ?? {})) {
-    for (const tab of tabs) {
-      mirroredTabIds.add(tab.id)
-    }
-  }
-  const paneSources: TabPaneInputSources = {
-    entriesByTabId: byTab,
-    ptyIdsByTabId,
-    runtimePaneTitlesByTabId,
-    terminalLayoutsByTabId
-  }
+  const indexes = buildSmartAttentionIndexes(
+    tabsByWorktree,
+    agentStatusByPaneKey,
+    migrationUnsupportedByPtyId
+  )
+  const sources = { tabsByWorktree, ptyIdsByTabId, runtimePaneTitlesByTabId, terminalLayoutsByTabId }
   const result = new Map<string, WorktreeAttention>()
-
   for (const worktree of worktrees) {
-    const tabs = tabsByWorktree?.[worktree.id] ?? []
-    // Why: hook stamps can precede tab mirroring; once mirrored, live tab ownership wins so both worktrees aren't promoted.
-    const panes: PaneInput[] = (byAttributedWorktree.get(worktree.id) ?? [])
-      .filter((entry) => {
-        const parsed = parsePaneKey(entry.paneKey)
-        return parsed !== null && !mirroredTabIds.has(parsed.tabId)
-      })
-      // No mirrored tab means no renderer live-PTY evidence to hold these hooks above Idle.
-      .map((entry) => ({ kind: 'hook' as const, entry, hasLivePty: false }))
-    if (tabs.length === 0) {
-      result.set(worktree.id, resolveAttention(panes, now))
-      continue
-    }
-    for (const tab of tabs) {
-      panes.push(...collectTabPaneInputs(tab, worktree.lastActivityAt, paneSources, now))
-    }
-    result.set(worktree.id, resolveAttention(panes, now))
+    result.set(worktree.id, resolveWorktreeAttention(worktree, indexes, sources, now))
   }
-
   return result
 }
